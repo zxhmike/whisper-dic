@@ -28,7 +28,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-codesign --force --sign - --identifier "$LABEL" "$APP"
+# Pin the designated requirement to the bundle ID so macOS privacy permissions
+# (Accessibility, Input Monitoring, Microphone) survive rebuilds.
+codesign --force --sign - --identifier "$LABEL" -r="designated => identifier \"$LABEL\"" "$APP"
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -45,5 +47,7 @@ cat > "$PLIST" <<EOF
 EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+# bootout returns before the old instance is gone; bootstrap fails with error 5 if it is still there
+while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do sleep 0.2; done
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "Installed $APP and started $LABEL"

@@ -20,7 +20,12 @@ Lives in `~/whisper-server/` (venv in `.venv`, token in `token`).
 ## mac/
 
 - `build.sh` builds `/Applications/Dictate.app` and installs a LaunchAgent. Every rebuild resets its macOS permissions, so after each one re-grant Input Monitoring, Accessibility and Microphone.
-- Triggers: tap right Option, or F13 (PrtSc on PC-layout keyboards).
+- Triggers: a lone tap of right Command or right Option, or F13 (Print Screen on a
+  PC-layout keyboard, i.e. a Keychron in Win mode; in Mac mode the Keychron's PrtSc key sends
+  Cmd+Shift+4, which can't be told apart from a real screenshot shortcut).
+- If a terminal has Secure Keyboard Entry on (Ghostty turns it on at password prompts and it
+  can stick), macOS hides key presses from every other app: F13 stops working while the
+  modifier taps still do. The app shows a warning bubble after 15 s of that.
 - Log: `~/Library/Logs/Dictate.log`
 
 ## Token

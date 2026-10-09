@@ -1,5 +1,6 @@
-// Dictate: tap right Option or press PrtSc (F13 on a Mac) to start recording, again to transcribe on
-// marvin's Whisper server, paste the text into the focused app and press Return.
+// Dictate: tap right Command or right Option (or press F13 / PC Print Screen) to start
+// recording, again to transcribe on marvin's Whisper server, paste the text into the
+// focused app and press Return.
 import AppKit
 import AVFoundation
 import Carbon.HIToolbox
@@ -76,59 +77,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var recorder: AVAudioRecorder?
     var busy = false
     var hotKeyRef: EventHotKeyRef?
+    var eventTap: CFMachPort?
+    // Modifier key currently held alone (keycode, when pressed); a quick release = tap.
+    var tapCandidate: (keycode: Int64, since: Date)?
+    var secureInputSince: Date?
+    var warnedSecureInput = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
         log("started; accessibility=\(AXIsProcessTrusted()) inputMonitoring=\(CGPreflightListenEventAccess()) mic=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
         registerHotKey()
-        installRightOptionTap()
+        installModifierTap()
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.checkSecureInput() }
     }
 
-    // A lone tap of right Option (no other key in between) toggles too.
-    // Needs Input Monitoring; retries until it has been granted.
-    var eventTap: CFMachPort?
-    var rightOptionDown: Date?
-    var loggedTapFailure = false
-
-    func installRightOptionTap() {
-        if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }
-        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
-            | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
-        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-                                     eventsOfInterest: mask, callback: { _, type, event, _ in
-            (NSApp.delegate as? AppDelegate)?.handle(type, event)
-            return Unmanaged.passUnretained(event)
-        }, userInfo: nil)
-        guard let eventTap else {
-            if !loggedTapFailure { log("right Option tap unavailable (no Input Monitoring yet); retrying"); loggedTapFailure = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.installRightOptionTap() }
-            return
-        }
-        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, eventTap, 0), .commonModes)
-        log("right Option tap installed")
-    }
-
-    func handle(_ type: CGEventType, _ event: CGEvent) {
-        if type == .flagsChanged {
-            log("flagsChanged keycode=\(event.getIntegerValueField(.keyboardEventKeycode))")
-        }
-        switch type {
-        case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
-        case .flagsChanged where event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_RightOption):
-            if event.flags.contains(.maskAlternate) {
-                rightOptionDown = Date()
-            } else if let down = rightOptionDown {
-                rightOptionDown = nil
-                if Date().timeIntervalSince(down) < 0.4 { toggle() }
-            }
-        default:
-            rightOptionDown = nil // another key, modifier or click: Option was used as a modifier
-        }
-    }
-
-    // PrtSc, which macOS sees as F13 on PC-layout keyboards (Carbon hotkeys need no permission)
+    // F13 = Print Screen on PC-layout keyboards (Carbon hotkeys need no permission).
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
@@ -140,8 +104,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
+    // A lone tap of right Command or right Option toggles too. Modifier events get
+    // through even while another app holds Secure Keyboard Entry, so this is the most
+    // dependable trigger. Needs Input Monitoring; retries until it has been granted.
+    func installModifierTap() {
+        if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }
+        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
+        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                     eventsOfInterest: mask, callback: { _, type, event, _ in
+            (NSApp.delegate as? AppDelegate)?.handle(type, event)
+            return Unmanaged.passUnretained(event)
+        }, userInfo: nil)
+        guard let eventTap else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.installModifierTap() }
+            return
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, eventTap, 0), .commonModes)
+    }
+
+    static let tapKeys: [Int64: CGEventFlags] = [
+        Int64(kVK_RightCommand): .maskCommand,
+        Int64(kVK_RightOption): .maskAlternate,
+    ]
+
+    func handle(_ type: CGEventType, _ event: CGEvent) {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+        case .flagsChanged:
+            let kc = event.getIntegerValueField(.keyboardEventKeycode)
+            guard let flag = Self.tapKeys[kc] else { tapCandidate = nil; return }
+            if event.flags.contains(flag) {
+                tapCandidate = (kc, Date())
+            } else if let c = tapCandidate, c.keycode == kc {
+                tapCandidate = nil
+                if Date().timeIntervalSince(c.since) < 0.4 { toggle() }
+            }
+        default:
+            tapCandidate = nil // another key or click: the modifier was used as a modifier
+        }
+    }
+
+    // Secure Keyboard Entry (a terminal at a password prompt, or stuck on) hides key
+    // presses from every other app, which silently kills the F13 hotkey. Say so.
+    func checkSecureInput() {
+        guard IsSecureEventInputEnabled() else {
+            secureInputSince = nil
+            warnedSecureInput = false
+            return
+        }
+        if secureInputSince == nil { secureInputSince = Date() }
+        if !warnedSecureInput, Date().timeIntervalSince(secureInputSince!) > 15 {
+            warnedSecureInput = true
+            log("secure keyboard entry has been on for 15s; F13 hotkey blocked")
+            hud.show("Secure Keyboard Entry is on in another app: Print Screen blocked, right ⌘/⌥ taps still work", for: 6)
+        }
+    }
+
     func toggle() {
-        log("toggle (recording=\(recorder?.isRecording ?? false) busy=\(busy))")
         if busy { return }
         if let recorder, recorder.isRecording {
             recorder.stop()
@@ -170,7 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let r = try AVAudioRecorder(url: clipURL, settings: settings)
             guard r.record(forDuration: 300) else { throw NSError(domain: "Dictate", code: 1) }
             recorder = r
-            hud.show("Recording… tap right ⌥ to stop")
+            hud.show("Recording… tap right ⌘ to stop")
         } catch {
             hud.show("Could not start recording", for: 4)
         }
