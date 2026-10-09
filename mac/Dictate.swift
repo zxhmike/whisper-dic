@@ -1,6 +1,6 @@
-// Dictate: tap right Command or right Option (or press F13 / PC Print Screen) to start
+// Dictate: tap right Command, right Option or Fn/Globe (or press F13 / PC Print Screen) to start
 // recording, again to transcribe on marvin's Whisper server, paste the text into the
-// focused app and press Return.
+// focused app and press Return. Shift+tap pastes without Return; Esc while recording cancels.
 import AppKit
 import AVFoundation
 import Carbon.HIToolbox
@@ -79,7 +79,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
     var eventTap: CFMachPort?
     // Modifier key currently held alone (keycode, when pressed); a quick release = tap.
-    var tapCandidate: (keycode: Int64, since: Date)?
+    var tapCandidate: (keycode: Int64, since: Date, shift: Bool)?
+    var startedWithShift = false
+    var swallowEscUp = false
     var secureInputSince: Date?
     var warnedSecureInput = false
 
@@ -104,16 +106,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
-    // A lone tap of right Command or right Option toggles too. Modifier events get
+    // A lone tap of right Command, right Option or Fn/Globe toggles too. Modifier events get
     // through even while another app holds Secure Keyboard Entry, so this is the most
     // dependable trigger. Needs Input Monitoring; retries until it has been granted.
     func installModifierTap() {
         if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }
         let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue) | (1 << 14) // 14 = NX_SYSDEFINED (media keys)
             | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
-        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+        // An active tap (not listen-only) so Esc can be swallowed while recording; every other
+        // event is passed through untouched. Needs Accessibility as well as Input Monitoring.
+        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                      eventsOfInterest: mask, callback: { _, type, event, _ in
-            (NSApp.delegate as? AppDelegate)?.handle(type, event)
+            if (NSApp.delegate as? AppDelegate)?.handle(type, event) == true { return nil }
             return Unmanaged.passUnretained(event)
         }, userInfo: nil)
         guard let eventTap else {
@@ -126,24 +131,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let tapKeys: [Int64: CGEventFlags] = [
         Int64(kVK_RightCommand): .maskCommand,
         Int64(kVK_RightOption): .maskAlternate,
+        // Needs System Settings > Keyboard > "Press globe key to" = Do Nothing
+        // (defaults write com.apple.HIToolbox AppleFnUsageType -int 0).
+        Int64(kVK_Function): .maskSecondaryFn,
     ]
 
-    func handle(_ type: CGEventType, _ event: CGEvent) {
+    // Returns true when the event should be swallowed.
+    func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
         case .flagsChanged:
             let kc = event.getIntegerValueField(.keyboardEventKeycode)
-            guard let flag = Self.tapKeys[kc] else { tapCandidate = nil; return }
+            // Other modifiers (Shift in particular) don't cancel a pending tap.
+            guard let flag = Self.tapKeys[kc] else { break }
             if event.flags.contains(flag) {
-                tapCandidate = (kc, Date())
+                tapCandidate = (kc, Date(), event.flags.contains(.maskShift))
             } else if let c = tapCandidate, c.keycode == kc {
                 tapCandidate = nil
-                if Date().timeIntervalSince(c.since) < 0.4 { toggle() }
+                if Date().timeIntervalSince(c.since) < 0.4 {
+                    toggle(shift: c.shift || event.flags.contains(.maskShift))
+                }
+            }
+        case .keyDown:
+            tapCandidate = nil
+            if event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Escape),
+               let r = recorder, r.isRecording {
+                r.stop()
+                recorder = nil
+                try? FileManager.default.removeItem(at: clipURL)
+                hud.show("Cancelled", for: 1)
+                swallowEscUp = true
+                return true
+            }
+        case .keyUp:
+            if swallowEscUp, event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Escape) {
+                swallowEscUp = false
+                return true
             }
         default:
-            tapCandidate = nil // another key or click: the modifier was used as a modifier
+            tapCandidate = nil // another key, media key or click: the modifier was used as a modifier
         }
+        return false
     }
 
     // Secure Keyboard Entry (a terminal at a password prompt, or stuck on) hides key
@@ -158,17 +187,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !warnedSecureInput, Date().timeIntervalSince(secureInputSince!) > 15 {
             warnedSecureInput = true
             log("secure keyboard entry has been on for 15s; F13 hotkey blocked")
-            hud.show("Secure Keyboard Entry is on in another app: Print Screen blocked, right ⌘/⌥ taps still work", for: 6)
+            hud.show("Secure Keyboard Entry is on in another app: Print Screen blocked, right ⌘/⌥/Fn taps still work", for: 6)
         }
     }
 
-    func toggle() {
+    // Shift held at the start or the stop tap: paste only, don't press Return.
+    func toggle(shift: Bool = false) {
         if busy { return }
         if let recorder, recorder.isRecording {
             recorder.stop()
             self.recorder = nil
-            transcribe()
+            transcribe(sendEnter: !(startedWithShift || shift))
         } else {
+            startedWithShift = shift
             startRecording()
         }
     }
@@ -191,13 +222,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let r = try AVAudioRecorder(url: clipURL, settings: settings)
             guard r.record(forDuration: 300) else { throw NSError(domain: "Dictate", code: 1) }
             recorder = r
-            hud.show("Recording… tap right ⌘ to stop")
+            hud.show("Recording… tap again to send · ⇧tap: paste only · Esc: cancel")
         } catch {
             hud.show("Could not start recording", for: 4)
         }
     }
 
-    func transcribe() {
+    func transcribe(sendEnter: Bool) {
         guard let token = try? String(contentsOfFile: tokenPath, encoding: .utf8),
               let audio = try? Data(contentsOf: clipURL) else {
             hud.show("Missing token or recording", for: 4)
@@ -221,14 +252,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else if text.isEmpty {
                     self.hud.show("No speech detected", for: 2)
                 } else {
-                    self.paste(text)
+                    self.paste(text, sendEnter: sendEnter)
                 }
             }
         }.resume()
     }
 
     // Paste via the clipboard (restored afterwards), then press Return to send.
-    func paste(_ text: String) {
+    func paste(_ text: String, sendEnter: Bool) {
         guard AXIsProcessTrusted() else {
             hud.show("Allow Accessibility access for Dictate in System Settings", for: 5)
             return
@@ -238,8 +269,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pb.clearContents()
         pb.setString(text, forType: .string)
         key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            self.key(CGKeyCode(kVK_Return), flags: [])
+        if sendEnter {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                self.key(CGKeyCode(kVK_Return), flags: [])
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             pb.clearContents()
