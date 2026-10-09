@@ -1,0 +1,11 @@
+[Unit]
+Description=Whisper transcription server for dictation
+After=network-online.target
+
+[Service]
+ExecStart=%h/whisper-server/run.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

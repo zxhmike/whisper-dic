@@ -1,0 +1,72 @@
+#!/bin/sh
+# Toggle dictation: first press starts recording, second press transcribes
+# on marvin's Whisper server and pastes the text into the focused window.
+# Pasting (not typing) keeps fcitx5 pinyin mode from eating the letters.
+# Usage: dictate [en|zh]   (default: auto-detect language)
+
+# Hotkey daemons may launch us without the session bus in the environment.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+exec 2>>"$XDG_RUNTIME_DIR/dictate.log"
+
+SERVER="http://100.100.184.6:8765/transcribe"
+TOKEN=$(cat "$HOME/.config/dictate/token")
+STATE="${XDG_RUNTIME_DIR:-/tmp}/dictate"
+WAV="$STATE/clip.wav"
+XDO="$HOME/.local/opt/xdotool/usr/bin/xdotool"
+export LD_LIBRARY_PATH="$HOME/.local/opt/xdotool/usr/lib/x86_64-linux-gnu"
+mkdir -p "$STATE"
+
+close_notify() {
+    id=$(cat "$STATE/notify-id" 2>/dev/null) && [ -n "$id" ] &&
+        gdbus call --session --dest org.freedesktop.Notifications \
+            --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.CloseNotification "$id" >/dev/null
+}
+
+notify() {
+    id=$(cat "$STATE/notify-id" 2>/dev/null)
+    notify-send -a Dictation -t "${2:-3000}" -p ${id:+-r "$id"} "Dictation" "$1" >"$STATE/notify-id"
+}
+
+if [ -f "$STATE/pid" ] && kill -0 "$(cat "$STATE/pid")" 2>/dev/null; then
+    kill -INT "$(cat "$STATE/pid")"
+    while kill -0 "$(cat "$STATE/pid")" 2>/dev/null; do sleep 0.05; done
+    rm -f "$STATE/pid"
+    notify "Transcribing…"
+    lang=$(cat "$STATE/lang" 2>/dev/null)
+    text=$(curl -sf --max-time 30 -H "Authorization: Bearer $TOKEN" \
+        --data-binary @"$WAV" "$SERVER${lang:+?lang=$lang}")
+    status=$?
+    rm -f "$WAV"
+    if [ $status -ne 0 ]; then
+        notify "Transcription failed (is marvin reachable?)" 5000
+        exit 1
+    fi
+    if [ -z "$text" ]; then
+        notify "No speech detected" 2000
+        exit 0
+    fi
+    old=$(xclip -o -selection clipboard 2>/dev/null)
+    printf %s "$text" | xclip -selection clipboard
+    win=$($XDO getactivewindow)
+    case "$(xprop -id "$win" WM_CLASS 2>/dev/null)" in
+        *[Tt]erminal*|*[Kk]itty*|*[Aa]lacritty*|*[Ww]ez[Tt]erm*|*[Xx][Tt]erm*) key=ctrl+shift+v ;;
+        *) key=ctrl+v ;;
+    esac
+    $XDO key --clearmodifiers "$key"
+    # Send it. Set DICTATE_NO_ENTER=1 to only paste.
+    if [ -z "$DICTATE_NO_ENTER" ]; then
+        sleep 0.15
+        $XDO key --clearmodifiers Return
+    fi
+    sleep 0.5
+    printf %s "$old" | xclip -selection clipboard
+    close_notify
+else
+    printf %s "$1" >"$STATE/lang"
+    arecord -q -f S16_LE -r 16000 -c 1 -d 300 "$WAV" &
+    echo $! >"$STATE/pid"
+    notify "Recording… press PrtSc to stop" 300000
+fi
